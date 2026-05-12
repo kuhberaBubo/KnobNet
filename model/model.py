@@ -18,7 +18,7 @@ class KnobNet(nn.Module):
 
         self.head = nn.Sequential(
             nn.Linear(head_in, 256),
-            nn.BatchNorm1d(256),
+            nn.LayerNorm(256),
             nn.ReLU(),
             nn.Dropout(0.3),
             nn.Linear(256, num_knobs),
@@ -117,3 +117,29 @@ class KnobNet(nn.Module):
               f"{c['mert_trainable']:>10,} / {c['mert_total']:,}")
         print(f"  Head :             {c['head_total']:>10,}")
         print(f"  Total trainable  : {c['total_trainable']:>10,}")
+
+    # ── export / load ────────────────────────────────────────────────────────────
+
+    def export(self, path):
+        """추론용 모델 저장. weights + 재구성에 필요한 config 포함."""
+        torch.save({
+            "model_state":   self.state_dict(),
+            "num_knobs":     self.num_knobs,
+            "mert_model_id": self.mert.config._name_or_path,
+            "knob_params":   KNOB_PARAMS,
+        }, path)
+
+    @classmethod
+    def from_exported(cls, path, device=None):
+        """export()로 저장한 파일에서 추론 가능한 KnobNet 반환."""
+        if device is None:
+            device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        saved = torch.load(path, map_location=device)
+        model = cls(
+            num_knobs     = saved["num_knobs"],
+            mert_model_id = saved["mert_model_id"],
+            freeze_mert   = False,
+        ).to(device)
+        model.load_state_dict(saved["model_state"])
+        model.eval()
+        return model
