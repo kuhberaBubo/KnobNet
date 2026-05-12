@@ -2,6 +2,7 @@ from pathlib import Path
 
 import torch
 import torch.nn as nn
+from tqdm import tqdm
 
 from utils.config import KNOB_PARAMS
 
@@ -22,7 +23,8 @@ def run_epoch(model, loader, optimizer, criterion, device) -> float:
     """1 epoch 학습, 평균 train loss 반환"""
     model.train()
     total = 0.0
-    for input_audio, ref_audio, knobs in loader:
+    bar = tqdm(loader, desc="  train", leave=False)
+    for input_audio, ref_audio, knobs in bar:
         input_audio = input_audio.to(device)
         ref_audio   = ref_audio.to(device)
         knobs       = knobs.to(device)
@@ -33,6 +35,7 @@ def run_epoch(model, loader, optimizer, criterion, device) -> float:
         torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
         optimizer.step()
         total += loss.item()
+        bar.set_postfix(loss=f"{loss.item():.4f}")
     return total / len(loader)
 
 
@@ -41,7 +44,7 @@ def evaluate(model, loader, criterion, device) -> float:
     model.eval()
     total = 0.0
     with torch.no_grad():
-        for input_audio, ref_audio, knobs in loader:
+        for input_audio, ref_audio, knobs in tqdm(loader, desc="    val", leave=False):
             input_audio = input_audio.to(device)
             ref_audio   = ref_audio.to(device)
             knobs       = knobs.to(device)
