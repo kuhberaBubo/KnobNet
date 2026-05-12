@@ -42,7 +42,11 @@ class KnobNet(nn.Module):
 
     def _encode(self, audio: torch.Tensor) -> torch.Tensor:
         # audio: (B, T) normalized → (B, hidden)
-        out = self.mert(input_values=audio, output_hidden_states=False)
+        # MERT가 frozen이면 계산 그래프 저장 안 함
+        frozen = not next(self.mert.parameters()).requires_grad
+        ctx = torch.no_grad() if frozen else torch.enable_grad()
+        with ctx:
+            out = self.mert(input_values=audio, output_hidden_states=False)
         return out.last_hidden_state.mean(dim=1)
 
     # ── forward ──────────────────────────────────────────────────────────────────

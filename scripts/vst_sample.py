@@ -9,7 +9,9 @@ VST3 플러그인을 사용해서 wet 데이터를 생성하는 프로그램
 
 import argparse
 import csv
+import os
 import random
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
 
 # ── sample 옵션 ───────────────────────────────────────────────────────────────
@@ -56,9 +58,11 @@ def cmd_info(args):
 # ── sample ────────────────────────────────────────────────────────────────────
 
 # 샘플링할 파라미터 (나머지는 FIXED_PARAMS 값으로 고정)
-SAMPLE_PARAMS = ["gain", "level", "filter"]
-FIXED_PARAMS = {"power": True, "bypass": False}
-N_PER_FILE = 10
+SAMPLE_PARAMS  = ["drive", "level", "filter"]
+FIXED_PARAMS   = {"power": True, "bypass": False}
+N_PER_FILE     = 5
+PARAM_MAX      = 10.0   # 모든 샘플링 파라미터의 최댓값 (정규화 스케일)
+N_WORKERS      = os.cpu_count()  # 병렬 워커 수
 
 
 def _sample_uniform(parameters: dict, n: int, rng: random.Random) -> list:
@@ -80,60 +84,81 @@ def _sample_grid(parameters: dict, n: int, rng: random.Random) -> list:
     ]
 
 
+def _process_wav_worker(vst_path, wav_path, configs, fixed_params, output_dir, start_idx):
+    """각 워커가 독립적으로 플러그인을 로드하고 wav를 처리."""
+    plugin = load_plugin(vst_path)
+    for name, value in fixed_params.items():
+        try:
+            setattr(plugin, name, value)
+        except (ValueError, TypeError, AttributeError):
+            pass
+    audio, sr = sf.read(wav_path)
+    rows = []
+    for i, config in enumerate(configs):
+        output_name = f"sample_{start_idx + i:05d}.wav"
+        wet = process_audio(plugin, audio, sr, config, input_gain_db=0.0)
+        sf.write(Path(output_dir) / output_name, wet, sr)
+        rows.append((wav_path, output_name, config))
+    return rows
+
+
 def cmd_sample(args):
     rng = random.Random(args.seed)
-    plugin = load_plugin(args.vst_path)
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    # 샘플링 대상 파라미터만 추출
+    # 파라미터 범위 정보는 메인 프로세스에서만 추출
+    plugin = load_plugin(args.vst_path)
     sample_parameters = {
         name: param for name, param in plugin.parameters.items()
         if name in SAMPLE_PARAMS
     }
 
+    # 전체 태스크 사전 생성 (rng 순서 보장)
+    counter = sum(1 for _ in output_dir.glob("sample_*.wav")) + 1
+    tasks = []  # (wav_file, configs, start_idx)
+    for input_dir in [Path(d) for d in args.input_dirs]:
+        wav_files = sorted(input_dir.rglob("*.wav"))
+        if not wav_files:
+            print(f"No wav files found in {input_dir}")
+            continue
+        for wav_file in wav_files:
+            if args.strategy == "uniform":
+                configs = _sample_uniform(sample_parameters, args.n_per_file, rng)
+            else:
+                configs = _sample_grid(sample_parameters, args.n_per_file, rng)
+            tasks.append((wav_file, configs, counter))
+            counter += len(configs)
+
+    # 병렬 처리 + 틈틈이 CSV 기록
     csv_path = output_dir / "samples.csv"
     csv_exists = csv_path.exists()
-    sample_counter = sum(1 for _ in output_dir.glob("sample_*.wav"))
+    total = len(tasks)
+    print_interval = max(1, total // 100)  # 1%마다 출력
 
     with open(csv_path, "a", newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(f, fieldnames=["input_file", "output_file"] + SAMPLE_PARAMS)
         if not csv_exists:
             writer.writeheader()
 
-        for input_dir in [Path(d) for d in args.input_dirs]:
-            wav_files = sorted(input_dir.rglob("*.wav"))
-            if not wav_files:
-                print(f"No wav files found in {input_dir}")
-                continue
-
-            if args.strategy == "uniform":
-                configs = _sample_uniform(sample_parameters, args.n_per_file, rng)
-            else:
-                configs = _sample_grid(sample_parameters, args.n_per_file, rng)
-
-            for wav_file in wav_files:
-                audio, sr = sf.read(wav_file)
-
-                # 고정 파라미터 적용
-                for name, value in FIXED_PARAMS.items():
-                    try:
-                        setattr(plugin, name, value)
-                    except (ValueError, TypeError, AttributeError):
-                        pass
-
-                for config in configs:
-                    sample_counter += 1
-                    output_name = f"sample_{sample_counter:05d}.wav"
-                    wet = process_audio(plugin, audio, sr, config, input_gain_db=0.0)
-                    sf.write(output_dir / output_name, wet, sr)
-
-                    writer.writerow({
-                        "input_file": str(wav_file),
-                        "output_file": output_name,
-                        **config,
-                    })
-                    print(f"[{sample_counter}] {wav_file.name} -> {output_name}")
+        with ProcessPoolExecutor(max_workers=N_WORKERS) as executor:
+            futures = {
+                executor.submit(
+                    _process_wav_worker,
+                    args.vst_path, str(wav_file), configs,
+                    FIXED_PARAMS, str(output_dir), start_idx
+                ): start_idx
+                for wav_file, configs, start_idx in tasks
+            }
+            for done, future in enumerate(as_completed(futures), 1):
+                rows = future.result()
+                for wav_path, output_name, config in rows:
+                    norm_config = {name: v / PARAM_MAX for name, v in config.items()}
+                    writer.writerow({"input_file": wav_path, "output_file": output_name, **norm_config})
+                f.flush()
+                if done % print_interval == 0 or done == total:
+                    total_samples = counter - 1
+                    print(f"[{done}/{total} files | {done * 100 // total}%] {total_samples}개 샘플 생성 중...")
 
     print(f"\nDone. CSV saved: {csv_path}")
 
