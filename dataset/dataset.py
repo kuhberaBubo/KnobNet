@@ -49,7 +49,7 @@ class KnobDataset(Dataset):
         )
 
     def _resolve_input(self, input_file: str) -> Path:
-        p = Path(input_file)
+        p = Path(input_file.replace("\\", "/"))
         return p if p.is_absolute() else self.dataset_root / p
 
     def _load_audio(self, path: Path) -> torch.Tensor:
