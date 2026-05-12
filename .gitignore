@@ -1,6 +1,10 @@
 # Data
 data/
 
+# Legacy & Claude
+_legacy/
+.claude/
+
 # Python
 __pycache__/
 *.py[cod]
