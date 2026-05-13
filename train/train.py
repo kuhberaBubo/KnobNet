@@ -19,10 +19,11 @@ def make_optimizer(model, lr: float, phase: int, mert_lr_scale: float = 0.1):
     ], weight_decay=1e-4)
 
 
-def run_epoch(model, loader, optimizer, criterion, device) -> float:
+def run_epoch(model, loader, optimizer, criterion, device, scaler=None) -> float:
     """1 epoch 학습, 평균 train loss 반환"""
     model.train()
     total = 0.0
+    amp = scaler is not None
     bar = tqdm(loader, desc="  train", leave=False)
     for input_audio, ref_audio, knobs in bar:
         input_audio = input_audio.to(device)
@@ -30,10 +31,20 @@ def run_epoch(model, loader, optimizer, criterion, device) -> float:
         knobs       = knobs.to(device)
 
         optimizer.zero_grad()
-        loss = criterion(model(input_audio, ref_audio), knobs)
-        loss.backward()
-        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-        optimizer.step()
+        with torch.autocast(device_type="cuda", enabled=amp):
+            loss = criterion(model(input_audio, ref_audio), knobs)
+
+        if amp:
+            scaler.scale(loss).backward()
+            scaler.unscale_(optimizer)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            scaler.step(optimizer)
+            scaler.update()
+        else:
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            optimizer.step()
+
         total += loss.item()
         bar.set_postfix(loss=f"{loss.item():.4f}")
     return total / len(loader)
@@ -43,12 +54,14 @@ def evaluate(model, loader, criterion, device) -> float:
     """validation loss 계산 (gradient 없음)"""
     model.eval()
     total = 0.0
+    amp = str(device).startswith("cuda")
     with torch.no_grad():
         for input_audio, ref_audio, knobs in tqdm(loader, desc="    val", leave=False):
             input_audio = input_audio.to(device)
             ref_audio   = ref_audio.to(device)
             knobs       = knobs.to(device)
-            total += criterion(model(input_audio, ref_audio), knobs).item()
+            with torch.autocast(device_type="cuda", enabled=amp):
+                total += criterion(model(input_audio, ref_audio), knobs).item()
     return total / len(loader)
 
 
@@ -56,9 +69,11 @@ def evaluate_per_param(model, loader, device) -> dict[str, float]:
     """파라미터별 MAE 계산  →  {"gain": 0.043, "level": 0.021, "filter": 0.087}"""
     model.eval()
     totals = torch.zeros(len(KNOB_PARAMS))
+    amp = str(device).startswith("cuda")
     with torch.no_grad():
         for input_audio, ref_audio, knobs in loader:
-            preds = model(input_audio.to(device), ref_audio.to(device)).cpu()
+            with torch.autocast(device_type="cuda", enabled=amp):
+                preds = model(input_audio.to(device), ref_audio.to(device)).cpu()
             totals += (preds - knobs).abs().mean(dim=0)
     mae = totals / len(loader)
     return {name: mae[i].item() for i, name in enumerate(KNOB_PARAMS)}
@@ -75,9 +90,11 @@ def evaluate_accuracy(model, loader, device, tolerance: float = 0.1) -> dict[str
     correct = torch.zeros(len(KNOB_PARAMS))
     correct_all = 0
     total = 0
+    amp = str(device).startswith("cuda")
     with torch.no_grad():
         for input_audio, ref_audio, knobs in loader:
-            preds = model(input_audio.to(device), ref_audio.to(device)).cpu()
+            with torch.autocast(device_type="cuda", enabled=amp):
+                preds = model(input_audio.to(device), ref_audio.to(device)).cpu()
             within = (preds - knobs).abs() <= tolerance   # (B, num_knobs) bool
             correct     += within.float().sum(dim=0)
             correct_all += within.all(dim=1).float().sum().item()
