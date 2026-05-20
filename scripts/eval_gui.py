@@ -336,6 +336,23 @@ class EvalApp:
                 ])  # (N, num_knobs)
             preds = all_preds.median(dim=0).values.tolist()
 
+            # ── DEBUG: vol 정보 출력 (MERT 재호출 없이 직접 계산) ──────────
+            try:
+                inp0 = inp_chunks[0]   # (CLIP_SAMPLES,)
+                ref0 = ref_chunks[0]
+                vol_input_dbg = float(inp0.pow(2).mean().sqrt())
+                vol_ref_dbg   = float(ref0.pow(2).mean().sqrt())
+                wet_rms_raw   = float(np.sqrt(np.mean(self.output_ref ** 2)))
+                print(f"[DEBUG] wet RMS (raw, before resample) = {wet_rms_raw:.6f}")
+                print(f"[DEBUG] vol_input = {vol_input_dbg:.6f}")
+                print(f"[DEBUG] vol_ref   = {vol_ref_dbg:.6f}")
+                print(f"[DEBUG] preds     = {[f'{v:.4f}' for v in preds]}")
+                knobs_norm = {n: knobs_raw[n] / PARAM_MAX for n in KNOB_PARAMS}
+                print(f"[DEBUG] true(norm)= {[f'{knobs_norm[n]:.4f}' for n in KNOB_PARAMS]}")
+            except Exception as dbg_e:
+                print(f"[DEBUG] error: {dbg_e}")
+            # ────────────────────────────────────────────────────────────────
+
             # Step 3: 예측 노브로 VST 재적용 → model output
             pred_raw = {n: preds[i] * PARAM_MAX for i, n in enumerate(KNOB_PARAMS)}
             self.output_model_audio = run_vst(self.plugin, self.input_audio, self.input_sr, pred_raw)
