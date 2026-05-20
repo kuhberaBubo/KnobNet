@@ -65,6 +65,40 @@ def evaluate(model, loader, criterion, device) -> float:
     return total / len(loader)
 
 
+def evaluate_all(model, loader, criterion, device, tolerance: float = 0.1) -> dict:
+    """val loss, MAE, accuracy를 단일 forward pass로 계산  →  val pass 3회 → 1회로 단축."""
+    model.eval()
+    amp = str(device).startswith("cuda")
+    loss_total = 0.0
+    mae_total  = torch.zeros(len(KNOB_PARAMS))
+    correct    = torch.zeros(len(KNOB_PARAMS))
+    correct_all = 0
+    n_samples  = 0
+    with torch.no_grad():
+        for input_audio, ref_audio, knobs in tqdm(loader, desc="    val", leave=False):
+            input_audio = input_audio.to(device)
+            ref_audio   = ref_audio.to(device)
+            knobs_gpu   = knobs.to(device)
+            with torch.autocast(device_type="cuda", enabled=amp):
+                preds = model(input_audio, ref_audio)
+            loss_total += criterion(preds, knobs_gpu).item()
+            preds_cpu   = preds.cpu()
+            diff        = (preds_cpu - knobs).abs()
+            mae_total  += diff.mean(dim=0)
+            within      = diff <= tolerance
+            correct    += within.float().sum(dim=0)
+            correct_all += within.all(dim=1).float().sum().item()
+            n_samples  += len(knobs)
+    mae = mae_total / len(loader)
+    acc = {name: (correct[i] / n_samples).item() for i, name in enumerate(KNOB_PARAMS)}
+    acc["all"] = correct_all / n_samples
+    return {
+        "val_loss": loss_total / len(loader),
+        "mae":      {name: mae[i].item() for i, name in enumerate(KNOB_PARAMS)},
+        "acc":      acc,
+    }
+
+
 def evaluate_per_param(model, loader, device) -> dict[str, float]:
     """파라미터별 MAE 계산  →  {"gain": 0.043, "level": 0.021, "filter": 0.087}"""
     model.eval()
