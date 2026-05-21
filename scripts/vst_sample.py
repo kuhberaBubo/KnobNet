@@ -58,7 +58,7 @@ def cmd_info(args):
 # ── sample ────────────────────────────────────────────────────────────────────
 
 # 샘플링할 파라미터 (나머지는 FIXED_PARAMS 값으로 고정)
-SAMPLE_PARAMS  = ["drive", "level", "filter"]
+SAMPLE_PARAMS  = ["drive", "level", "tone"]
 FIXED_PARAMS   = {"power": True, "bypass": False}
 N_PER_FILE     = 5
 PARAM_MAX      = 10.0   # 모든 샘플링 파라미터의 최댓값 (정규화 스케일)
@@ -153,7 +153,11 @@ def cmd_sample(args):
             for done, future in enumerate(as_completed(futures), 1):
                 rows = future.result()
                 for wav_path, output_name, config in rows:
-                    norm_config = {name: v / PARAM_MAX for name, v in config.items()}
+                    norm_config = {}
+                    for name, v in config.items():
+                        normalized = v / PARAM_MAX
+                        key = "tone" if name == "filter" else name
+                        norm_config[key] = (1 - normalized) if name == "filter" else normalized
                     writer.writerow({"input_file": wav_path, "output_file": output_name, **norm_config})
                 f.flush()
                 if done % print_interval == 0 or done == total:

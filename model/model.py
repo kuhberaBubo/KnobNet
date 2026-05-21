@@ -7,21 +7,34 @@ from utils.config import MERT_MODEL_ID, MERT_SR, KNOB_PARAMS
 
 class KnobNet(nn.Module):
 
-    def __init__(self, num_knobs: int = 3, mert_model_id: str = MERT_MODEL_ID, freeze_mert: bool = True):
+    def __init__(self, num_knobs: int = 3, mert_model_id: str = MERT_MODEL_ID, freeze_mert: bool = True,
+                 layer_idx: int = -1):
         super().__init__()
         self.num_knobs = num_knobs
 
         self.mert = AutoModel.from_pretrained(mert_model_id, trust_remote_code=True)
+        self.layer_idx = layer_idx   # -1 = last_hidden_state, 1~12 = hidden_states[i]
 
         hidden = self.mert.config.hidden_size       # 768
         head_in = hidden * 2 + 2                    # I_feat + O_feat + vol_input + vol_ref
 
-        self.head = nn.Sequential(
+        # Head A: drive + tone 예측
+        self.head_a = nn.Sequential(
             nn.Linear(head_in, 256),
             nn.LayerNorm(256),
             nn.ReLU(),
             nn.Dropout(0.3),
-            nn.Linear(256, num_knobs),
+            nn.Linear(256, num_knobs - 1),          # drive, tone (level 제외)
+            nn.Sigmoid(),
+        )
+
+        # Head B: level 예측 (Head A 출력 pred_drive, pred_tone 추가 입력)
+        self.head_b = nn.Sequential(
+            nn.Linear(head_in + (num_knobs - 1), 256),  # +2 (pred_drive, pred_tone)
+            nn.LayerNorm(256),
+            nn.ReLU(),
+            nn.Dropout(0.3),
+            nn.Linear(256, 1),                      # level
             nn.Sigmoid(),
         )
 
@@ -45,15 +58,18 @@ class KnobNet(nn.Module):
         # MERT가 frozen이면 계산 그래프 저장 안 함
         frozen = not next(self.mert.parameters()).requires_grad
         ctx = torch.no_grad() if frozen else torch.enable_grad()
+        use_hidden = self.layer_idx != -1
         with ctx:
-            out = self.mert(input_values=audio, output_hidden_states=False)
+            out = self.mert(input_values=audio, output_hidden_states=use_hidden)
+        if use_hidden:
+            return out.hidden_states[self.layer_idx].mean(dim=1)
         return out.last_hidden_state.mean(dim=1)
 
     # ── forward ──────────────────────────────────────────────────────────────────
 
     def forward(self, input_audio: torch.Tensor, reference_audio: torch.Tensor) -> torch.Tensor:
         # input_audio, reference_audio: (B, T) raw audio at MERT_SR
-        # returns: (B, num_knobs) ∈ [0, 1]
+        # returns: (B, num_knobs) ∈ [0, 1]  순서: [drive, level, tone]
 
         vol_input = self._rms(input_audio)       # (B, 1) — normalize 전에 뽑음
         vol_ref   = self._rms(reference_audio)   # (B, 1)
@@ -62,7 +78,13 @@ class KnobNet(nn.Module):
         O_feat = self._encode(self._normalize(reference_audio))   # (B, 768)
 
         x = torch.cat([vol_input, I_feat, vol_ref, O_feat], dim=-1)  # (B, 1538)
-        return self.head(x)                                            # (B, num_knobs)
+
+        pred_dt    = self.head_a(x)                                    # (B, 2) [drive, tone]
+        x_b        = torch.cat([x, pred_dt.detach()], dim=-1)         # (B, 1540)
+        pred_level = self.head_b(x_b)                                  # (B, 1)
+
+        # KNOB_PARAMS 순서 [drive, level, tone] 에 맞춰 조합
+        return torch.cat([pred_dt[:, :1], pred_level, pred_dt[:, 1:]], dim=-1)  # (B, 3)
 
     # ── phase 전환 ───────────────────────────────────────────────────────────────
 
@@ -80,7 +102,7 @@ class KnobNet(nn.Module):
         return self.mert.parameters()
 
     def head_parameters(self):
-        return self.head.parameters()
+        return list(self.head_a.parameters()) + list(self.head_b.parameters())
 
     # ── 디버그 ───────────────────────────────────────────────────────────────────
 
@@ -91,20 +113,24 @@ class KnobNet(nn.Module):
             vol_ref   = self._rms(reference_audio)
             I_feat    = self._encode(self._normalize(input_audio))
             O_feat    = self._encode(self._normalize(reference_audio))
-            head_in   = torch.cat([vol_input, I_feat, vol_ref, O_feat], dim=-1)
+            x         = torch.cat([vol_input, I_feat, vol_ref, O_feat], dim=-1)
+            pred_dt   = self.head_a(x)
         return {
             "vol_input":  vol_input,    # (B, 1)
             "vol_ref":    vol_ref,      # (B, 1)
             "I_feat":     I_feat,       # (B, 768)
             "O_feat":     O_feat,       # (B, 768)
-            "head_input": head_in,      # (B, 1538)
+            "head_input": x,            # (B, 1538)
+            "pred_drive": pred_dt[:, :1],  # (B, 1)
+            "pred_tone":  pred_dt[:, 1:],  # (B, 1)
         }
 
     def count_parameters(self) -> dict:
         """파라미터 수 집계"""
         mert_total     = sum(p.numel() for p in self.mert.parameters())
         mert_trainable = sum(p.numel() for p in self.mert.parameters() if p.requires_grad)
-        head_total     = sum(p.numel() for p in self.head.parameters())
+        head_total     = sum(p.numel() for p in self.head_a.parameters()) + \
+                         sum(p.numel() for p in self.head_b.parameters())
         return {
             "mert_total":      mert_total,
             "mert_trainable":  mert_trainable,
@@ -131,6 +157,7 @@ class KnobNet(nn.Module):
             "num_knobs":     self.num_knobs,
             "mert_model_id": self.mert.config._name_or_path,
             "knob_params":   KNOB_PARAMS,
+            "layer_idx":     self.layer_idx,
         }, path)
 
     @classmethod
@@ -143,6 +170,7 @@ class KnobNet(nn.Module):
             num_knobs     = saved["num_knobs"],
             mert_model_id = saved["mert_model_id"],
             freeze_mert   = False,
+            layer_idx     = saved.get("layer_idx", -1),
         ).to(device)
         model.load_state_dict(saved["model_state"])
         model.eval()
