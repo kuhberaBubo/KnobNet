@@ -18,6 +18,19 @@ def _cache_key(path: Path) -> str:
     return hashlib.md5(str(path.resolve()).encode()).hexdigest() + ".pt"
 
 
+def _layer_cache_dir(base: Path, layer_idx: int) -> Path:
+    """layer_idx별 캐시 서브디렉터리 반환."""
+    return base / (f"layer{layer_idx:02d}" if layer_idx != -1 else "last")
+
+
+def _head_forward(model, x: torch.Tensor) -> torch.Tensor:
+    """캐시 임베딩 기반 forward (head_a → head_b 2단계)."""
+    pred_dt    = model.head_a(x)
+    x_b        = torch.cat([x, pred_dt.detach()], dim=-1)
+    pred_level = model.head_b(x_b)
+    return torch.cat([pred_dt[:, :1], pred_level, pred_dt[:, 1:]], dim=-1)
+
+
 # ── 임베딩 캐시 생성 ──────────────────────────────────────────────────────────
 
 def cache_embeddings(
@@ -26,10 +39,12 @@ def cache_embeddings(
     input_dirs: list[str] | None = None,
     cache_dir: str | Path | None = None,
     device: str | None = None,
+    layer_idx: int = -1,
 ):
     """오디오 파일을 MERT로 인코딩해 캐시 저장. 이미 캐시된 파일은 스킵."""
     dataset_root = Path(dataset_root)
-    cache_dir = Path(cache_dir) if cache_dir else dataset_root / "cache"
+    base_dir  = Path(cache_dir) if cache_dir else dataset_root / "cache"
+    cache_dir = _layer_cache_dir(base_dir, layer_idx)
     cache_dir.mkdir(parents=True, exist_ok=True)
 
     if device is None:
@@ -46,7 +61,7 @@ def cache_embeddings(
 
     print(f"유니크 오디오 파일 : {len(unique_paths):,}개")
 
-    model = KnobNet(freeze_mert=True).to(device)
+    model = KnobNet(freeze_mert=True, layer_idx=layer_idx).to(device)
     model.eval()
 
     skipped = 0
@@ -78,11 +93,13 @@ class _CachedKnobDataset(Dataset):
         wet_dir: str = "wet",
         input_dirs: list[str] | None = None,
         cache_dir: str | Path | None = None,
+        layer_idx: int = -1,
     ):
         self.dataset_root = Path(dataset_root)
         self.wet_dir = self.dataset_root / wet_dir
         self.input_dirs = input_dirs
-        self.cache_dir = Path(cache_dir) if cache_dir else self.dataset_root / "cache"
+        base_dir = Path(cache_dir) if cache_dir else self.dataset_root / "cache"
+        self.cache_dir = _layer_cache_dir(base_dir, layer_idx)
         self.items = self._load_csv()
 
     def _load_csv(self) -> list:
@@ -137,10 +154,12 @@ def make_loaders_cached(
     val_split: float = 0.2,
     num_workers: int = 2,
     seed: int = 42,
+    layer_idx: int = -1,
 ) -> tuple[DataLoader, DataLoader]:
     """캐시된 임베딩 기반 DataLoader 생성 (오디오 로드·MERT 실행 없음)."""
     ds = _CachedKnobDataset(dataset_root, wet_dir=wet_dir,
-                            input_dirs=input_dirs, cache_dir=cache_dir)
+                            input_dirs=input_dirs, cache_dir=cache_dir,
+                            layer_idx=layer_idx)
 
     groups = ds.unique_inputs()
     unique_inputs = sorted(groups.keys())
@@ -186,17 +205,17 @@ def run_epoch_cached(model, loader, optimizer, criterion, device, scaler=None) -
 
         optimizer.zero_grad()
         with torch.autocast(device_type="cuda", enabled=amp):
-            loss = criterion(model.head(x), knobs)
+            loss = criterion(_head_forward(model, x), knobs)
 
         if amp:
             scaler.scale(loss).backward()
             scaler.unscale_(optimizer)
-            torch.nn.utils.clip_grad_norm_(model.head.parameters(), 1.0)
+            torch.nn.utils.clip_grad_norm_(model.head_parameters(), 1.0)
             scaler.step(optimizer)
             scaler.update()
         else:
             loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.head.parameters(), 1.0)
+            torch.nn.utils.clip_grad_norm_(model.head_parameters(), 1.0)
             optimizer.step()
 
         total += loss.item()
@@ -213,7 +232,7 @@ def evaluate_cached(model, loader, criterion, device) -> float:
         for I_feat, vol_i, O_feat, vol_r, knobs in tqdm(loader, desc="    val", leave=False):
             x = _to_head_input(I_feat, vol_i, O_feat, vol_r, device)
             with torch.autocast(device_type="cuda", enabled=amp):
-                total += criterion(model.head(x), knobs.to(device)).item()
+                total += criterion(_head_forward(model, x), knobs.to(device)).item()
     return total / len(loader)
 
 
@@ -230,7 +249,7 @@ def evaluate_all_cached(model, loader, criterion, device, tolerance: float = 0.1
         for I_feat, vol_i, O_feat, vol_r, knobs in tqdm(loader, desc="    val", leave=False):
             x = _to_head_input(I_feat, vol_i, O_feat, vol_r, device)
             with torch.autocast(device_type="cuda", enabled=amp):
-                preds = model.head(x)
+                preds = _head_forward(model, x)
             loss_total += criterion(preds, knobs.to(device)).item()
             preds_cpu   = preds.cpu()
             diff        = (preds_cpu - knobs).abs()
@@ -257,7 +276,7 @@ def evaluate_per_param_cached(model, loader, device) -> dict[str, float]:
     with torch.no_grad():
         for I_feat, vol_i, O_feat, vol_r, knobs in loader:
             with torch.autocast(device_type="cuda", enabled=amp):
-                preds = model.head(_to_head_input(I_feat, vol_i, O_feat, vol_r, device)).cpu()
+                preds = _head_forward(model, _to_head_input(I_feat, vol_i, O_feat, vol_r, device)).cpu()
             totals += (preds - knobs).abs().mean(dim=0)
     mae = totals / len(loader)
     return {name: mae[i].item() for i, name in enumerate(KNOB_PARAMS)}
@@ -278,7 +297,7 @@ def evaluate_accuracy_cached(model, loader, device, tolerance: float = 0.1) -> d
     with torch.no_grad():
         for I_feat, vol_i, O_feat, vol_r, knobs in loader:
             with torch.autocast(device_type="cuda", enabled=amp):
-                preds = model.head(_to_head_input(I_feat, vol_i, O_feat, vol_r, device)).cpu()
+                preds = _head_forward(model, _to_head_input(I_feat, vol_i, O_feat, vol_r, device)).cpu()
             within = (preds - knobs).abs() <= tolerance
             correct     += within.float().sum(dim=0)
             correct_all += within.all(dim=1).float().sum().item()

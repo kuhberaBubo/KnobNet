@@ -58,7 +58,7 @@ def cmd_info(args):
 # ── sample ────────────────────────────────────────────────────────────────────
 
 # 샘플링할 파라미터 (나머지는 FIXED_PARAMS 값으로 고정)
-SAMPLE_PARAMS  = ["drive", "level", "tone"]
+SAMPLE_PARAMS  = ["drive", "level", "filter"]  # 실제 플러그인 파라미터명; CSV에는 "tone"으로 저장됨
 FIXED_PARAMS   = {"power": True, "bypass": False}
 N_PER_FILE     = 5
 PARAM_MAX      = 10.0   # 모든 샘플링 파라미터의 최댓값 (정규화 스케일)
@@ -137,7 +137,8 @@ def cmd_sample(args):
     print_interval = max(1, total // 100)  # 1%마다 출력
 
     with open(csv_path, "a", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=["input_file", "output_file"] + SAMPLE_PARAMS)
+        csv_fields = ["tone" if p == "filter" else p for p in SAMPLE_PARAMS]
+        writer = csv.DictWriter(f, fieldnames=["input_file", "output_file"] + csv_fields)
         if not csv_exists:
             writer.writeheader()
 
