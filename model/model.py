@@ -175,3 +175,74 @@ class KnobNet(nn.Module):
         model.load_state_dict(saved["model_state"])
         model.eval()
         return model
+
+
+# ── Joint-encode variant ───────────────────────────────────────────────────────
+
+class KnobNetJoint(KnobNet):
+    """input + reference audio를 concat해 MERT 한 번에 통과시키는 variant.
+    HEAD 구조는 KnobNet과 완전히 동일하며, 인코딩 방식만 다름.
+    """
+
+    def _encode_joint(
+        self,
+        input_audio: torch.Tensor,
+        ref_audio: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """(B, T) + (B, T) → concat (B, 2T) → MERT → split at T//2
+        반환: I_feat (B, hidden), O_feat (B, hidden)
+        """
+        combined = torch.cat([input_audio, ref_audio], dim=-1)   # (B, 2T)
+        frozen = not next(self.mert.parameters()).requires_grad
+        ctx = torch.no_grad() if frozen else torch.enable_grad()
+        use_hidden = self.layer_idx != -1
+        with ctx:
+            out = self.mert(input_values=combined, output_hidden_states=use_hidden)
+        frames = out.hidden_states[self.layer_idx] if use_hidden else out.last_hidden_state
+        # frames: (B, T_total, hidden)
+        half = frames.shape[1] // 2
+        I_feat = frames[:, :half, :].mean(dim=1)   # (B, hidden)
+        O_feat = frames[:, half:, :].mean(dim=1)   # (B, hidden)
+        return I_feat, O_feat
+
+    def forward(self, input_audio: torch.Tensor, reference_audio: torch.Tensor) -> torch.Tensor:
+        vol_input = self._rms(input_audio)
+        vol_ref   = self._rms(reference_audio)
+
+        I_feat, O_feat = self._encode_joint(
+            self._normalize(input_audio),
+            self._normalize(reference_audio),
+        )
+
+        x = torch.cat([vol_input, I_feat, vol_ref, O_feat], dim=-1)  # (B, 1538)
+
+        pred_dt    = self.head_a(x)
+        x_b        = torch.cat([x, pred_dt.detach()], dim=-1)
+        pred_level = self.head_b(x_b)
+
+        return torch.cat([pred_dt[:, :1], pred_level, pred_dt[:, 1:]], dim=-1)  # (B, 3)
+
+    def export(self, path):
+        torch.save({
+            "model_state":   self.state_dict(),
+            "num_knobs":     self.num_knobs,
+            "mert_model_id": self.mert.config._name_or_path,
+            "knob_params":   KNOB_PARAMS,
+            "layer_idx":     self.layer_idx,
+            "model_class":   "joint",
+        }, path)
+
+    @classmethod
+    def from_exported(cls, path, device=None):
+        if device is None:
+            device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        saved = torch.load(path, map_location=device)
+        model = cls(
+            num_knobs     = saved["num_knobs"],
+            mert_model_id = saved["mert_model_id"],
+            freeze_mert   = False,
+            layer_idx     = saved.get("layer_idx", -1),
+        ).to(device)
+        model.load_state_dict(saved["model_state"])
+        model.eval()
+        return model

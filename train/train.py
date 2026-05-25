@@ -1,3 +1,4 @@
+import csv
 from pathlib import Path
 
 import torch
@@ -136,6 +137,28 @@ def evaluate_accuracy(model, loader, device, tolerance: float = 0.1) -> dict[str
     acc = {name: (correct[i] / total).item() for i, name in enumerate(KNOB_PARAMS)}
     acc["all"] = correct_all / total
     return acc
+
+
+def log_csv(csv_path, phase: int, epoch: int, train_loss: float, val_loss: float,
+            mae: dict[str, float], acc: dict[str, float]):
+    """에포크 지표를 CSV에 한 줄 추가. 파일 없으면 헤더도 작성."""
+    path = Path(csv_path)
+    write_header = not path.exists()
+    mae_keys = list(mae.keys())
+    acc_keys = list(acc.keys())
+    with open(path, "a", newline="", encoding="utf-8") as f:
+        writer = csv.writer(f)
+        if write_header:
+            writer.writerow(
+                ["phase", "epoch", "train_loss", "val_loss"]
+                + [f"mae_{k}" for k in mae_keys]
+                + [f"acc_{k}" for k in acc_keys]
+            )
+        writer.writerow([
+            phase, epoch, round(train_loss, 6), round(val_loss, 6),
+            *[round(mae[k], 6) for k in mae_keys],
+            *[round(acc[k], 6) for k in acc_keys],
+        ])
 
 
 def log_param_mae(mae: dict[str, float]):

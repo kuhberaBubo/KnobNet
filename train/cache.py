@@ -8,7 +8,7 @@ from torch.utils.data import DataLoader, Dataset, Subset
 from tqdm import tqdm
 
 from dataset.dataset import KnobDataset
-from model.model import KnobNet
+from model.model import KnobNet, KnobNetJoint
 from utils.config import KNOB_PARAMS
 
 
@@ -307,6 +307,177 @@ def evaluate_accuracy_cached(model, loader, device, tolerance: float = 0.1) -> d
     return acc
 
 
+# ── Joint 캐시 ────────────────────────────────────────────────────────────────
+
+def _pair_cache_key(inp: Path, ref: Path) -> str:
+    """(input_path, ref_path) 쌍의 캐시 파일명."""
+    combined = str(inp.resolve()) + "|" + str(ref.resolve())
+    return hashlib.md5(combined.encode()).hexdigest() + ".pt"
+
+
+def _joint_cache_dir(base: Path, layer_idx: int) -> Path:
+    """joint 캐시 서브디렉터리 반환."""
+    suffix = f"layer{layer_idx:02d}" if layer_idx != -1 else "last"
+    return base / f"joint_{suffix}"
+
+
+def cache_embeddings_joint(
+    dataset_root: str | Path,
+    wet_dir: str = "wet",
+    input_dirs: list[str] | None = None,
+    cache_dir: str | Path | None = None,
+    device: str | None = None,
+    layer_idx: int = -1,
+):
+    """input+ref 쌍을 concat해 MERT로 인코딩 후 쌍 단위 캐시 저장.
+    이미 캐시된 쌍은 스킵."""
+    dataset_root = Path(dataset_root)
+    base_dir  = Path(cache_dir) if cache_dir else dataset_root / "cache"
+    cache_dir = _joint_cache_dir(base_dir, layer_idx)
+    cache_dir.mkdir(parents=True, exist_ok=True)
+
+    if device is None:
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+
+    print(f"joint cache dir : {cache_dir}")
+    print(f"device          : {device}")
+
+    ds = KnobDataset(dataset_root, wet_dir=wet_dir, input_dirs=input_dirs)
+    unique_pairs: set[tuple[Path, Path]] = set()
+    for input_path, ref_path, _, _ in ds.items:
+        unique_pairs.add((input_path, ref_path))
+
+    print(f"유니크 오디오 쌍 : {len(unique_pairs):,}개")
+
+    model = KnobNetJoint(freeze_mert=True, layer_idx=layer_idx).to(device)
+    model.eval()
+
+    skipped = 0
+    for inp_path, ref_path in tqdm(sorted(unique_pairs), desc="caching joint"):
+        out_path = cache_dir / _pair_cache_key(inp_path, ref_path)
+        if out_path.exists():
+            skipped += 1
+            continue
+
+        inp_audio = ds._load_audio(inp_path).unsqueeze(0).to(device)  # (1, T)
+        ref_audio = ds._load_audio(ref_path).unsqueeze(0).to(device)  # (1, T)
+
+        with torch.no_grad():
+            vol_i = model._rms(inp_audio).cpu()                          # (1, 1)
+            vol_r = model._rms(ref_audio).cpu()                          # (1, 1)
+            I_feat, O_feat = model._encode_joint(
+                model._normalize(inp_audio),
+                model._normalize(ref_audio),
+            )
+            I_feat = I_feat.cpu()   # (1, 768)
+            O_feat = O_feat.cpu()   # (1, 768)
+
+        torch.save({"I_feat": I_feat, "vol_i": vol_i,
+                    "O_feat": O_feat, "vol_r": vol_r}, out_path)
+
+    done = len(unique_pairs) - skipped
+    print(f"완료: {done:,}개 인코딩 / {skipped:,}개 스킵")
+
+
+class _CachedKnobDatasetJoint(Dataset):
+    """쌍 단위 joint 캐시 기반 Dataset."""
+
+    def __init__(
+        self,
+        dataset_root: str | Path,
+        wet_dir: str = "wet",
+        input_dirs: list[str] | None = None,
+        cache_dir: str | Path | None = None,
+        layer_idx: int = -1,
+    ):
+        self.dataset_root = Path(dataset_root)
+        self.wet_dir = self.dataset_root / wet_dir
+        self.input_dirs = input_dirs
+        base_dir = Path(cache_dir) if cache_dir else self.dataset_root / "cache"
+        self.cache_dir = _joint_cache_dir(base_dir, layer_idx)
+        self.items = self._load_csv()
+
+    def _load_csv(self) -> list:
+        items = []
+        with open(self.wet_dir / "samples.csv", newline="", encoding="utf-8") as f:
+            for row in csv.DictReader(f):
+                inp = self._resolve(row["input_file"])
+                ref = self.wet_dir / row["output_file"]
+                if not inp.exists() or not ref.exists():
+                    continue
+                if not self._in_dirs(inp):
+                    continue
+                knobs = torch.tensor([float(row[p]) for p in KNOB_PARAMS], dtype=torch.float32)
+                items.append((inp, ref, knobs, row["input_file"]))
+        return items
+
+    def _resolve(self, f: str) -> Path:
+        p = Path(f.replace("\\", "/"))
+        return p if p.is_absolute() else self.dataset_root / p
+
+    def _in_dirs(self, path: Path) -> bool:
+        if self.input_dirs is None:
+            return True
+        return any(part in self.input_dirs for part in path.parts)
+
+    def _load(self, inp_path: Path, ref_path: Path):
+        data = torch.load(self.cache_dir / _pair_cache_key(inp_path, ref_path),
+                          weights_only=True)
+        return (data["I_feat"].squeeze(0), data["vol_i"].squeeze(0),
+                data["O_feat"].squeeze(0), data["vol_r"].squeeze(0))
+
+    def __len__(self) -> int:
+        return len(self.items)
+
+    def __getitem__(self, idx: int) -> tuple:
+        inp, ref, knobs, _ = self.items[idx]
+        I_feat, vol_i, O_feat, vol_r = self._load(inp, ref)
+        return I_feat, vol_i, O_feat, vol_r, knobs
+
+    def unique_inputs(self) -> dict:
+        groups: dict[str, list[int]] = {}
+        for i, (*_, input_file) in enumerate(self.items):
+            groups.setdefault(input_file, []).append(i)
+        return groups
+
+
+def make_loaders_cached_joint(
+    dataset_root,
+    wet_dir: str = "wet",
+    input_dirs: list[str] | None = None,
+    cache_dir=None,
+    batch_size: int = 256,
+    val_split: float = 0.2,
+    num_workers: int = 2,
+    seed: int = 42,
+    layer_idx: int = -1,
+) -> tuple[DataLoader, DataLoader]:
+    """joint 캐시 기반 DataLoader 생성 (run_epoch_cached 재사용 가능)."""
+    ds = _CachedKnobDatasetJoint(dataset_root, wet_dir=wet_dir,
+                                  input_dirs=input_dirs, cache_dir=cache_dir,
+                                  layer_idx=layer_idx)
+
+    groups = ds.unique_inputs()
+    unique_inputs = sorted(groups.keys())
+    rng = random.Random(seed)
+    rng.shuffle(unique_inputs)
+
+    val_count = max(1, int(len(unique_inputs) * val_split))
+    val_inputs = set(unique_inputs[:val_count])
+    train_inputs = set(unique_inputs[val_count:])
+
+    train_idx = [i for f, idxs in groups.items() if f in train_inputs for i in idxs]
+    val_idx   = [i for f, idxs in groups.items() if f in val_inputs   for i in idxs]
+
+    kw = dict(num_workers=num_workers, pin_memory=True, persistent_workers=num_workers > 0)
+    train_loader = DataLoader(Subset(ds, train_idx), batch_size=batch_size, shuffle=True,  **kw)
+    val_loader   = DataLoader(Subset(ds, val_idx),   batch_size=batch_size, shuffle=False, **kw)
+
+    print(f"input 파일 수 : {len(unique_inputs):,}  (train {len(train_inputs):,} / val {len(val_inputs):,})")
+    print(f"sample 수     : train {len(train_idx):,} / val {len(val_idx):,}")
+    return train_loader, val_loader
+
+
 # ── 사용 예시 ──────────────────────────────────────────────────────────────────
 #
 # from train.cache import (
@@ -318,7 +489,7 @@ def evaluate_accuracy_cached(model, loader, device, tolerance: float = 0.1) -> d
 #     make_optimizer, save_checkpoint, load_checkpoint,
 #     log_epoch, log_param_mae, log_accuracy,
 # )
-# from model.model import KnobNet
+# from model.model import KnobNet, KnobNetJoint
 # import torch.nn as nn
 #
 # # ── Step 1: 한 번만 실행 (GPU 필요) ──
