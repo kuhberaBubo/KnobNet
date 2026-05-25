@@ -10,8 +10,11 @@ from pathlib import Path
 import pandas as pd
 import numpy as np
 
+sys.path.insert(0, str(Path(__file__).parent.parent))
+from utils.config import KNOB_PARAMS
+
 TOLERANCE = 0.1
-PARAMS = ["drive", "level", "filter"]
+PARAMS = KNOB_PARAMS
 
 
 def mae(df, param):

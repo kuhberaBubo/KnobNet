@@ -28,6 +28,7 @@ def main():
         "num_knobs":     len(KNOB_PARAMS),
         "mert_model_id": MERT_MODEL_ID,
         "knob_params":   KNOB_PARAMS,
+        "layer_idx":     ckpt.get("layer_idx", -1),
     }
 
     dst.parent.mkdir(parents=True, exist_ok=True)

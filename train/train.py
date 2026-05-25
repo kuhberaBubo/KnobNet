@@ -183,6 +183,7 @@ def save_checkpoint(path, model, epoch: int, phase: int, val_loss: float,
         "epoch":       epoch,
         "model_state": model.state_dict(),
         "val_loss":    val_loss,
+        "layer_idx":   getattr(model, "layer_idx", -1),
     }
     if optimizer is not None:
         payload["optimizer_state"] = optimizer.state_dict()

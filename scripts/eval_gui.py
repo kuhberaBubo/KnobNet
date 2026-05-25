@@ -89,13 +89,19 @@ def to_model_tensors(audio: np.ndarray, sr: int) -> torch.Tensor:
 
 
 def run_vst(plugin, audio: np.ndarray, sr: int, knobs_raw: dict) -> np.ndarray:
-    """VST 적용. knobs_raw: {"drive": 5.0, "level": 3.0, "filter": 7.0}"""
+    """VST 적용. knobs_raw: {"drive": 5.0, "level": 3.0, "tone": 7.0}
+    tone → filter 변환: filter = PARAM_MAX - tone  (filter = 1 - tone, normalized 기준)
+    """
+    vst_params = {
+        ("filter" if k == "tone" else k): (PARAM_MAX - v if k == "tone" else v)
+        for k, v in knobs_raw.items()
+    }
     for name, val in FIXED_PARAMS.items():
         try:
             setattr(plugin, name, val)
         except Exception:
             pass
-    for name, val in knobs_raw.items():
+    for name, val in vst_params.items():
         try:
             setattr(plugin, name, val)
         except (ValueError, TypeError):
@@ -121,14 +127,8 @@ def compute_mel_db(audio: np.ndarray, sr: int) -> np.ndarray:
 
 
 def _load_model(path: Path) -> KnobNet:
-    """exported 또는 checkpoint 형식 모두 지원"""
-    ckpt = torch.load(path, map_location="cpu", weights_only=False)
-    if "num_knobs" in ckpt:
-        return KnobNet.from_exported(path, device=torch.device("cpu"))
-    # save_checkpoint 형식
-    model = KnobNet(freeze_mert=False)
-    model.load_state_dict(ckpt["model_state"])
-    return model
+    """model.export()로 저장한 파일 로드"""
+    return KnobNet.from_exported(path, device=torch.device("cpu"))
 
 
 # ── GUI ──────────────────────────────────────────────────────────────────────

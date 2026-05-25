@@ -1,5 +1,5 @@
 {
-  "model": "C:/Users/khw04/Downloads/KnobNet/knobnet_final.pt",
+  "model": "C:/Users/khw04/Downloads/KnobNet/data/knobnet_final_epoch24.pt",
   "vst": "C:/Users/khw04/Downloads/KnobNet/vst/NA Black.vst3",
   "wav": "C:/Users/khw04/Downloads/KnobNet/data/clean-sequences/clean_middle-neck_sequence_1112.wav"
 }
