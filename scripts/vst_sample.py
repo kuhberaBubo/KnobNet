@@ -19,7 +19,8 @@ VST_PATH = Path("vst/NA Black.vst3")
 SAMPLE_INPUT_DIRS = [Path("data/clean-sequences"), Path("data/flat")]
 SAMPLE_OUTPUT_DIR = Path("data/wet/black")
 SAMPLE_STRATEGY = "uniform"   # "uniform" or "grid"
-SAMPLE_SEED = 42
+#SAMPLE_SEED = 42
+SAMPLE_SEED = 47
 
 import numpy as np
 import sounddevice as sd
@@ -38,7 +39,10 @@ def process_audio(plugin, audio: np.ndarray, sr: int, param_config: dict, input_
         try:
             setattr(plugin, name, value)
         except (ValueError, TypeError):
-            setattr(plugin, name, bool(value > 0.5))
+            try:
+                setattr(plugin, name, bool(value > 0.5))
+            except (ValueError, TypeError):
+                pass  # 'program' 같은 문자열 enum 파라미터는 스킵
     return plugin.process(apply_gain(audio, input_gain_db), sr)
 
 
@@ -50,15 +54,18 @@ def cmd_info(args):
     print(f"Params : {len(plugin.parameters)}\n")
     for name, param in plugin.parameters.items():
         print(f"  {name}")
-        print(f"    range  : {param.min_value:.4f} ~ {param.max_value:.4f}")
-        print(f"    default: {param.default_raw_value:.4f}")
+        if param.min_value is not None and param.max_value is not None:
+            print(f"    range  : {param.min_value:.4f} ~ {param.max_value:.4f}")
+            print(f"    default: {param.default_raw_value:.4f}")
+        else:
+            print(f"    range  : (non-numeric)")
         print()
 
 
 # ── sample ────────────────────────────────────────────────────────────────────
 
 # 샘플링할 파라미터 (나머지는 FIXED_PARAMS 값으로 고정)
-SAMPLE_PARAMS  = ["drive", "level", "filter"]  # 실제 플러그인 파라미터명; CSV에는 "tone"으로 저장됨
+SAMPLE_PARAMS  = ["drive", "level", "tone"]  # 실제 플러그인 파라미터명; CSV에는 "tone"으로 저장됨 filter
 FIXED_PARAMS   = {"power": True, "bypass": False}
 N_PER_FILE     = 5
 PARAM_MAX      = 10.0   # 모든 샘플링 파라미터의 최댓값 (정규화 스케일)
